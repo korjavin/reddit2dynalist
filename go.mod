@@ -1,6 +1,6 @@
 module github.com/korjavin/reddit2dynalist
 
-go 1.23.2
+go 1.23
 
 require github.com/vartanbeno/go-reddit/v2 v2.0.1
 
