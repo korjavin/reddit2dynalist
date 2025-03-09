@@ -27,10 +27,17 @@ func main() {
 		Password: os.Getenv("REDDIT_PASSWORD"),
 	}
 
-	redditClient, err := reddit.NewClient(credentials)
+	client, err := reddit.NewClient(credentials, reddit.WithUserAgent("reddit2dynalist:v1.0"))
 	if err != nil {
 		log.Fatal("Failed to create Reddit client:", err)
 	}
+
+	// Verify authentication
+	me, _, err := client.User.Get(context.Background(), credentials.Username)
+	if err != nil {
+		log.Fatal("Failed to authenticate:", err)
+	}
+	log.Printf("Authenticated as: %s", me.Name)
 
 	dynalist := &DynalistClient{
 		apiKey:  os.Getenv("DYNALIST_API_KEY"),
@@ -39,7 +46,7 @@ func main() {
 
 	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		saved, _, _, err := redditClient.User.Saved(context.Background(), &reddit.ListUserOverviewOptions{Sort: "new", Time: "day"})
+		saved, _, _, err := client.User.Saved(context.Background(), &reddit.ListUserOverviewOptions{Sort: "new", Time: "day"})
 		if err != nil {
 			log.Printf("Error fetching saved posts: %v", err)
 			continue
