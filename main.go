@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vartanbeno/go-reddit/v2/reddit"
+	"golang.org/x/oauth2"
 )
 
 // DynalistClient handles API interactions with Dynalist
@@ -29,16 +30,55 @@ type DynalistResponse struct {
 
 // DynalistCreateItemRequest represents the request to create an item
 type DynalistCreateItemRequest struct {
-	Token       string `json:"token"`
-	DocumentID  string `json:"file_id"`
-	ParentID    string `json:"parent_id,omitempty"`
-	Content     string `json:"content"`
-	InsertAfter string `json:"insert_after,omitempty"`
+	Token    string        `json:"token"`
+	FileID   string        `json:"file_id"`
+	Changes  []DynalistChange `json:"changes"`
+}
+
+// DynalistChange represents a single change operation in Dynalist
+type DynalistChange struct {
+	Action    string `json:"action"`
+	ParentID  string `json:"parent_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Index     int    `json:"index,omitempty"`
 }
 
 // Cache stores post IDs to avoid duplicates
 type Cache struct {
 	Posts map[string]time.Time
+}
+
+// SaveCache saves the cache to a file
+func (c *Cache) SaveToFile(filename string) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cache: %w", err)
+	}
+	
+	return os.WriteFile(filename, data, 0644)
+}
+
+// LoadCache loads the cache from a file
+func LoadCacheFromFile(filename string) (*Cache, error) {
+	// Create an empty cache in case the file doesn't exist
+	cache := &Cache{
+		Posts: make(map[string]time.Time),
+	}
+	
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return empty cache if file doesn't exist
+			return cache, nil
+		}
+		return nil, fmt.Errorf("failed to read cache file: %w", err)
+	}
+	
+	if err := json.Unmarshal(data, cache); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cache: %w", err)
+	}
+	
+	return cache, nil
 }
 
 // NewDynalistClient creates a new Dynalist client
@@ -52,10 +92,21 @@ func NewDynalistClient(apiKey string) *DynalistClient {
 
 // CreateItem creates a new item in a Dynalist document
 func (d *DynalistClient) CreateItem(documentID string, content string) error {
+	// Using the correct Dynalist API endpoint for adding items
+	// https://dynalist.io/developer/api#doc-edit
+	
+	// Create a change object to add a new item at the root level
+	change := DynalistChange{
+		Action:   "insert",
+		ParentID: "root", // Add at root level
+		Content:  content,
+		Index:    0,      // Add at the beginning
+	}
+	
 	req := DynalistCreateItemRequest{
-		Token:      d.APIKey,
-		DocumentID: documentID,
-		Content:    content,
+		Token:   d.APIKey,
+		FileID:  documentID,
+		Changes: []DynalistChange{change},
 	}
 
 	jsonData, err := json.Marshal(req)
@@ -63,7 +114,8 @@ func (d *DynalistClient) CreateItem(documentID string, content string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/doc/children/add", d.BaseURL)
+	// Using the correct endpoint from Dynalist docs
+	url := fmt.Sprintf("%s/doc/edit", d.BaseURL)
 	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -144,10 +196,19 @@ func (d *DynalistClient) GetDocumentID(name string) (string, error) {
 }
 
 func main() {
-	// Initialize cache
-	cache := Cache{
-		Posts: make(map[string]time.Time),
+	// Set up cache file location
+	cacheFile := "reddit2dynalist.cache.json"
+	
+	// Load cache from file or create a new one
+	cache, err := LoadCacheFromFile(cacheFile)
+	if err != nil {
+		log.Printf("Warning: Failed to load cache: %v. Creating a new cache.", err)
+		cache = &Cache{
+			Posts: make(map[string]time.Time),
+		}
 	}
+	
+	log.Printf("Loaded cache with %d previously processed posts", len(cache.Posts))
 
 	// Load Reddit credentials from environment variables
 	credentials := reddit.Credentials{
@@ -165,18 +226,47 @@ func main() {
 	}
 
 	// Create Reddit client with appropriate user agent
-	client, err := reddit.NewClient(
-		credentials,
-		reddit.WithUserAgent(fmt.Sprintf("script:reddit2dynalist:v1.0 (by /u/%s)", credentials.Username)),
+	// The Reddit API requires a user agent in specific format
+	userAgent := fmt.Sprintf("script:reddit2dynalist:v1.0 (by /u/%s)", credentials.Username)
+	
+	// Set up OAuth2 configuration for Reddit
+	ctx := context.Background()
+	oauth2Config := &oauth2.Config{
+		ClientID:     credentials.ID,
+		ClientSecret: credentials.Secret,
+		Endpoint: oauth2.Endpoint{
+			TokenURL: "https://www.reddit.com/api/v1/access_token",
+			AuthURL:  "https://www.reddit.com/api/v1/authorize",
+		},
+	}
+	
+	// Create an OAuth2 token for password credentials
+	token, err := oauth2Config.PasswordCredentialsToken(ctx, credentials.Username, credentials.Password)
+	if err != nil {
+		log.Fatalf("Failed to get OAuth token: %v", err)
+	}
+	
+	// Create HTTP client with OAuth2
+	httpClient := oauth2Config.Client(ctx, token)
+	httpClient.Timeout = time.Second * 30
+	
+	// Create Reddit client with OAuth HTTP client
+	client, err := reddit.NewClient(credentials,
+		reddit.WithUserAgent(userAgent),
+		reddit.WithHTTPClient(httpClient),
 	)
+	
 	if err != nil {
 		log.Fatal("Failed to create Reddit client:", err)
 	}
 
 	// Verify Reddit authentication
-	me, _, err := client.User.Get(context.Background(), credentials.Username)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	me, _, err := client.User.Get(ctx, credentials.Username)
 	if err != nil {
-		log.Fatal("Failed to authenticate with Reddit:", err)
+		log.Fatalf("Failed to authenticate with Reddit: %v (Check your credentials and ensure your app is set up as a 'script' type)", err)
 	}
 	log.Printf("Successfully authenticated as: %s", me.Name)
 
@@ -199,11 +289,11 @@ func main() {
 	log.Printf("Starting to check for new saved posts every 5 minutes...")
 
 	// Process saved posts immediately on startup
-	processNewPosts(client, dynalist, documentID, &cache)
+	processNewPosts(client, dynalist, documentID, cache, cacheFile)
 
 	// Then process on each tick
 	for range ticker.C {
-		processNewPosts(client, dynalist, documentID, &cache)
+		processNewPosts(client, dynalist, documentID, cache, cacheFile)
 	}
 }
 
@@ -212,6 +302,7 @@ func processNewPosts(
 	dynalistClient *DynalistClient,
 	documentID string,
 	cache *Cache,
+	cacheFile string,
 ) {
 	ctx := context.Background()
 	
@@ -275,5 +366,10 @@ func processNewPosts(
 		log.Printf("Added %d new posts to Dynalist", newPosts)
 	} else {
 		log.Printf("No new posts found")
+	}
+	
+	// Save cache to file for persistence between runs
+	if err := cache.SaveToFile(cacheFile); err != nil {
+		log.Printf("Warning: Failed to save cache: %v", err)
 	}
 }
