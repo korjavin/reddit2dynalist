@@ -2,6 +2,8 @@
 
 Automatically sync your saved Reddit posts to Dynalist.
 
+This application uses the [graw](https://github.com/turnage/graw) library to interact with the Reddit API.
+
 ## Configuration
 
 The application requires the following environment variables:
