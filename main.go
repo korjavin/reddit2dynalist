@@ -301,11 +301,12 @@ func processNewPosts(
 		} else {
 			content = fmt.Sprintf("Post by %s - https://reddit.com%s", post.Author, post.Permalink)
 		}
+		title := fmt.Sprintf("Post by %s - https://reddit.com%s", post.Author, post.Permalink)
 
 		log.Printf("Adding new saved post to Dynalist: %s", content)
 
 		// Create item in Dynalist
-		err = AddToDynalist(os.Getenv("DYNALIST_API_KEY"), post.Title, content)
+		err = AddToDynalist(os.Getenv("DYNALIST_API_KEY"), title, content)
 		if err != nil {
 			log.Printf("Error creating Dynalist item: %v", err)
 			continue
