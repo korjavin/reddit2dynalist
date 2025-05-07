@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -15,19 +15,20 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const (
+	redditRedirectURI = "http://localhost:8080/callback"
+	redditTokenFile   = "reddit_refresh_token.txt"
+)
+
 // RedditCredentials contains the credentials needed for Reddit API
 type RedditCredentials struct {
-	ClientID     string
-	ClientSecret string
-	Username     string
-	Password     string
+	ClientID string
 }
 
 // RedditClient handles interactions with the Reddit API
 type RedditClient struct {
-	Credentials RedditCredentials
-	HTTPClient  *http.Client
-	UserAgent   string
+	HTTPClient *http.Client
+	UserAgent  string
 }
 
 // RedditPost represents a saved post or comment from Reddit
@@ -66,98 +67,114 @@ func (c *Cache) SaveToFile(filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal cache: %w", err)
 	}
-
 	return os.WriteFile(filename, data, 0644)
 }
 
 // LoadCacheFromFile loads the cache from a file
 func LoadCacheFromFile(filename string) (*Cache, error) {
-	// Create an empty cache in case the file doesn't exist
-	cache := &Cache{
-		Posts: make(map[string]time.Time),
-	}
-
+	cache := &Cache{Posts: make(map[string]time.Time)}
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Return empty cache if file doesn't exist
 			return cache, nil
 		}
 		return nil, fmt.Errorf("failed to read cache file: %w", err)
 	}
-
 	if err := json.Unmarshal(data, cache); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal cache: %w", err)
 	}
-
 	return cache, nil
 }
 
-// NewRedditClient creates a new Reddit client
-func NewRedditClient(credentials RedditCredentials) (*RedditClient, error) {
-	// Set up OAuth2 configuration for Reddit
+// NewRedditClient creates a new Reddit client using the installed app flow
+func NewRedditClient(clientID, refreshToken string) (*RedditClient, error) {
 	ctx := context.Background()
 	oauth2Config := &oauth2.Config{
-		ClientID:     credentials.ClientID,
-		ClientSecret: credentials.ClientSecret,
+		ClientID:     clientID,
+		ClientSecret: "",
+		RedirectURL:  redditRedirectURI,
+		Scopes:       []string{"history", "identity", "read", "save"},
 		Endpoint: oauth2.Endpoint{
 			TokenURL: "https://www.reddit.com/api/v1/access_token",
 			AuthURL:  "https://www.reddit.com/api/v1/authorize",
 		},
 	}
-
-	var token *oauth2.Token
-	retryErr := retryWithBackoff(5, 2*time.Second, func() error {
-		var err error
-		token, err = oauth2Config.PasswordCredentialsToken(ctx, credentials.Username, credentials.Password)
-		return err
-	})
-	if retryErr != nil {
-		return nil, fmt.Errorf("failed to get OAuth token: %v", retryErr)
-	}
-
-	// Create HTTP client with OAuth2
-	httpClient := oauth2Config.Client(ctx, token)
-	httpClient.Timeout = time.Second * 30
-
-	// Create Reddit client with user agent
-	userAgent := fmt.Sprintf("script:reddit2dynalist:v1.0 (by /u/%s)", credentials.Username)
-
+	token := &oauth2.Token{RefreshToken: refreshToken}
+	tokenSource := oauth2Config.TokenSource(ctx, token)
+	httpClient := oauth2.NewClient(ctx, tokenSource)
+	httpClient.Timeout = 30 * time.Second
+	userAgent := "script:reddit2dynalist:v1.0 (by /u/yourusername)" // Change to your Reddit username
 	return &RedditClient{
-		Credentials: credentials,
-		HTTPClient:  httpClient,
-		UserAgent:   userAgent,
+		HTTPClient: httpClient,
+		UserAgent:  userAgent,
 	}, nil
 }
 
-// GetSavedPosts retrieves saved posts from Reddit
-func (r *RedditClient) GetSavedPosts(ctx context.Context, limit int) ([]RedditPost, error) {
-	url := fmt.Sprintf("https://oauth.reddit.com/user/%s/saved?limit=%d&sort=new",
-		r.Credentials.Username, limit)
+// One-time: Run this to get a refresh token
+func getRedditRefreshToken(clientID string) (string, error) {
+	oauth2Config := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: "",
+		RedirectURL:  redditRedirectURI,
+		Scopes:       []string{"history", "identity", "read", "save"},
+		Endpoint: oauth2.Endpoint{
+			TokenURL: "https://www.reddit.com/api/v1/access_token",
+			AuthURL:  "https://www.reddit.com/api/v1/authorize",
+		},
+	}
+	fmt.Printf("DEBUG: Using clientID=%q, redirectURI=%q\n", clientID, redditRedirectURI)
+	state := fmt.Sprintf("%d", rand.Int())
+	authURL := oauth2Config.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.ApprovalForce)
+	fmt.Println("Go to the following URL in your browser and authorize the app:")
+	fmt.Println(authURL)
 
+	codeCh := make(chan string)
+	srv := &http.Server{Addr: ":8080"}
+	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		receivedState := r.URL.Query().Get("state")
+		code := r.URL.Query().Get("code")
+		fmt.Printf("DEBUG: Received callback with state=%q, code=%q\n", receivedState, code)
+		if receivedState != state {
+			http.Error(w, "State mismatch", http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(w, "Authorization successful! You can close this window.")
+		codeCh <- code
+		go srv.Shutdown(context.Background())
+	})
+	go func() { _ = srv.ListenAndServe() }()
+	code := <-codeCh
+
+	fmt.Printf("DEBUG: Exchanging code: %q\n", code)
+	ctx := context.Background()
+	token, err := oauth2Config.Exchange(ctx, code)
+	if err != nil {
+		fmt.Printf("DEBUG: Exchange error: %v\n", err)
+		return "", fmt.Errorf("failed to exchange code for token: %w", err)
+	}
+	return token.RefreshToken, nil
+}
+
+func (r *RedditClient) GetSavedPosts(ctx context.Context, username string, limit int) ([]RedditPost, error) {
+	url := fmt.Sprintf("https://oauth.reddit.com/user/%s/saved?limit=%d&sort=new", username, limit)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
 	req.Header.Set("User-Agent", r.UserAgent)
-
 	resp, err := r.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("Reddit API error: %s, Body: %s", resp.Status, string(body))
 	}
-
 	var redditResp RedditResponse
 	if err := json.NewDecoder(resp.Body).Decode(&redditResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-
 	var posts []RedditPost
 	for _, child := range redditResp.Data.Children {
 		post := child.Data
@@ -165,134 +182,83 @@ func (r *RedditClient) GetSavedPosts(ctx context.Context, limit int) ([]RedditPo
 		post.IsComment = (child.Kind == "t1")
 		posts = append(posts, post)
 	}
-
 	return posts, nil
 }
 
-// VerifyAuthentication verifies that the client can authenticate with Reddit
-func (r *RedditClient) VerifyAuthentication(ctx context.Context) error {
-	url := fmt.Sprintf("https://oauth.reddit.com/api/v1/me")
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("User-Agent", r.UserAgent)
-
-	resp, err := r.HTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Reddit API error: %s, Body: %s", resp.Status, string(body))
-	}
-
-	var user struct {
-		Name string `json:"name"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if user.Name != r.Credentials.Username {
-		return fmt.Errorf("authenticated as %s instead of %s", user.Name, r.Credentials.Username)
-	}
-
-	return nil
-}
-
 func main() {
-	// Set up cache file location
-	cacheFile := "reddit2dynalist.cache.json"
+	authorize := flag.Bool("authorize", false, "Run OAuth2 authorization flow to get refresh token")
+	flag.Parse()
 
-	// Load cache from file or create a new one
-	cache, err := LoadCacheFromFile(cacheFile)
-	if err != nil {
-		log.Printf("Warning: Failed to load cache: %v. Creating a new cache.", err)
-		cache = &Cache{
-			Posts: make(map[string]time.Time),
+	clientID := os.Getenv("REDDIT_CLIENT_ID")
+	username := os.Getenv("REDDIT_USERNAME")
+	dynalistKey := os.Getenv("DYNALIST_API_KEY")
+	if clientID == "" || username == "" || dynalistKey == "" {
+		log.Fatal("Missing required environment variables. Please set REDDIT_CLIENT_ID, REDDIT_USERNAME, and DYNALIST_API_KEY")
+	}
+
+	if *authorize {
+		refreshToken, err := getRedditRefreshToken(clientID)
+		if err != nil {
+			log.Fatalf("Failed to get refresh token: %v", err)
 		}
+		fmt.Printf("Your refresh token (save this!):\n%s\n", refreshToken)
+		if err := os.WriteFile(redditTokenFile, []byte(refreshToken), 0600); err != nil {
+			log.Fatalf("Failed to save refresh token: %v", err)
+		}
+		fmt.Println("Refresh token saved to", redditTokenFile)
+		return
 	}
 
-	log.Printf("Loaded cache with %d previously processed posts", len(cache.Posts))
-
-	// Load credentials from environment variables
-	credentials := RedditCredentials{
-		ClientID:     os.Getenv("REDDIT_CLIENT_ID"),
-		ClientSecret: os.Getenv("REDDIT_CLIENT_SECRET"),
-		Username:     os.Getenv("REDDIT_USERNAME"),
-		Password:     os.Getenv("REDDIT_PASSWORD"),
+	refreshTokenBytes, err := os.ReadFile(redditTokenFile)
+	if err != nil {
+		log.Fatalf("Failed to read refresh token file: %v", err)
 	}
+	refreshToken := string(refreshTokenBytes)
 
-	// Validate all required environment variables
-	if credentials.ClientID == "" || credentials.ClientSecret == "" ||
-		credentials.Username == "" || credentials.Password == "" ||
-		os.Getenv("DYNALIST_API_KEY") == "" {
-		log.Fatal("Missing required environment variables. Please set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD, and DYNALIST_API_KEY")
-	}
-
-	// Create Reddit client
-	redditClient, err := NewRedditClient(credentials)
+	redditClient, err := NewRedditClient(clientID, refreshToken)
 	if err != nil {
 		log.Fatal("Failed to create Reddit client:", err)
 	}
 
-	// Verify Reddit authentication
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := redditClient.VerifyAuthentication(ctx); err != nil {
-		cancel()
-		log.Fatalf("Failed to authenticate with Reddit: %v", err)
+	cacheFile := "reddit2dynalist.cache.json"
+	cache, err := LoadCacheFromFile(cacheFile)
+	if err != nil {
+		log.Printf("Warning: Failed to load cache: %v. Creating a new cache.", err)
+		cache = &Cache{Posts: make(map[string]time.Time)}
 	}
-	cancel()
-	log.Printf("Successfully authenticated as: %s", credentials.Username)
+	log.Printf("Loaded cache with %d previously processed posts", len(cache.Posts))
 
-	// Set up ticker for periodic checking (5 minutes)
 	ticker := time.NewTicker(5 * time.Minute)
 	log.Printf("Starting to check for new saved posts every 5 minutes...")
 
-	// Process saved posts immediately on startup
-	processNewPosts(redditClient, cache, cacheFile)
-
-	// Then process on each tick
+	processNewPosts(redditClient, username, dynalistKey, cache, cacheFile)
 	for range ticker.C {
-		processNewPosts(redditClient, cache, cacheFile)
+		processNewPosts(redditClient, username, dynalistKey, cache, cacheFile)
 	}
 }
 
 func processNewPosts(
 	redditClient *RedditClient,
+	username string,
+	dynalistKey string,
 	cache *Cache,
 	cacheFile string,
 ) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Get saved posts
-	posts, err := redditClient.GetSavedPosts(ctx, 25)
+	posts, err := redditClient.GetSavedPosts(ctx, username, 25)
 	if err != nil {
 		log.Printf("Error fetching saved posts: %v", err)
 		return
 	}
 
-	// Track how many new posts we found
 	newPosts := 0
-
-	// Process each post
 	for _, post := range posts {
-		// Skip if we've already processed this post
 		if _, exists := cache.Posts[post.FullID]; exists {
 			continue
 		}
-
-		// Add to cache with current timestamp
 		cache.Posts[post.FullID] = time.Now()
-
-		// Create content for Dynalist
 		var content string
 		if post.IsComment {
 			content = fmt.Sprintf("Comment by %s - https://reddit.com%s", post.Author, post.Permalink)
@@ -302,20 +268,15 @@ func processNewPosts(
 			content = fmt.Sprintf("Post by %s - https://reddit.com%s", post.Author, post.Permalink)
 		}
 		title := fmt.Sprintf("Post by %s - https://reddit.com%s", post.Author, post.Permalink)
-
 		log.Printf("Adding new saved post to Dynalist: %s", content)
-
-		// Create item in Dynalist
-		err = AddToDynalist(os.Getenv("DYNALIST_API_KEY"), title, content)
+		err = AddToDynalist(dynalistKey, title, content)
 		if err != nil {
 			log.Printf("Error creating Dynalist item: %v", err)
 			continue
 		}
-
 		newPosts++
 	}
 
-	// Cleanup cache - remove entries older than 7 days
 	now := time.Now()
 	for id, timestamp := range cache.Posts {
 		if now.Sub(timestamp) > 7*24*time.Hour {
@@ -329,31 +290,7 @@ func processNewPosts(
 		log.Printf("No new posts found")
 	}
 
-	// Save cache to file for persistence between runs
 	if err := cache.SaveToFile(cacheFile); err != nil {
 		log.Printf("Warning: Failed to save cache: %v", err)
 	}
-}
-
-// retryWithBackoff retries the given function with exponential backoff on error.
-// It stops retrying if the error is not a 429 or after maxAttempts.
-func retryWithBackoff(maxAttempts int, baseDelay time.Duration, fn func() error) error {
-	var err error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = fn()
-		if err == nil {
-			return nil
-		}
-		var httpErr *oauth2.RetrieveError
-		if errors.As(err, &httpErr) && httpErr.Response != nil && httpErr.Response.StatusCode == 429 {
-			// Exponential backoff
-			sleep := time.Duration(math.Pow(2, float64(attempt))) * baseDelay
-			log.Printf("Received 429 Too Many Requests. Retrying in %v...", sleep)
-			time.Sleep(sleep)
-			continue
-		}
-		// Not a 429, break immediately
-		break
-	}
-	return err
 }
