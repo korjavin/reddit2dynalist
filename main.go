@@ -5,14 +5,54 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/vartanbeno/go-reddit/v2/reddit"
 	"golang.org/x/oauth2"
 )
+
+// RedditCredentials contains the credentials needed for Reddit API
+type RedditCredentials struct {
+	ClientID     string
+	ClientSecret string
+	Username     string
+	Password     string
+}
+
+// RedditClient handles interactions with the Reddit API
+type RedditClient struct {
+	Credentials RedditCredentials
+	HTTPClient  *http.Client
+	UserAgent   string
+}
+
+// RedditPost represents a saved post or comment from Reddit
+type RedditPost struct {
+	Kind      string `json:"kind"`
+	ID        string `json:"id"`
+	FullID    string `json:"name"`
+	Title     string `json:"title,omitempty"`
+	Author    string `json:"author"`
+	Permalink string `json:"permalink"`
+	URL       string `json:"url,omitempty"`
+	Created   float64 `json:"created_utc"`
+	IsComment bool    `json:"-"` // Internal field
+}
+
+// RedditResponse represents the response from Reddit API
+type RedditResponse struct {
+	Kind string `json:"kind"`
+	Data struct {
+		Children []struct {
+			Kind string     `json:"kind"`
+			Data RedditPost `json:"data"`
+		} `json:"children"`
+		After string `json:"after"`
+	} `json:"data"`
+}
 
 // DynalistClient handles API interactions with Dynalist
 type DynalistClient struct {
@@ -28,10 +68,10 @@ type DynalistResponse struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
-// DynalistCreateItemRequest represents the request to create an item
-type DynalistCreateItemRequest struct {
-	Token    string        `json:"token"`
-	FileID   string        `json:"file_id"`
+// DynalistEditRequest represents the request to edit a document
+type DynalistEditRequest struct {
+	Token    string          `json:"token"`
+	FileID   string          `json:"file_id"`
 	Changes  []DynalistChange `json:"changes"`
 }
 
@@ -48,7 +88,7 @@ type Cache struct {
 	Posts map[string]time.Time
 }
 
-// SaveCache saves the cache to a file
+// SaveToFile saves the cache to a file
 func (c *Cache) SaveToFile(filename string) error {
 	data, err := json.Marshal(c)
 	if err != nil {
@@ -58,7 +98,7 @@ func (c *Cache) SaveToFile(filename string) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-// LoadCache loads the cache from a file
+// LoadCacheFromFile loads the cache from a file
 func LoadCacheFromFile(filename string) (*Cache, error) {
 	// Create an empty cache in case the file doesn't exist
 	cache := &Cache{
@@ -81,6 +121,115 @@ func LoadCacheFromFile(filename string) (*Cache, error) {
 	return cache, nil
 }
 
+// NewRedditClient creates a new Reddit client
+func NewRedditClient(credentials RedditCredentials) (*RedditClient, error) {
+	// Set up OAuth2 configuration for Reddit
+	ctx := context.Background()
+	oauth2Config := &oauth2.Config{
+		ClientID:     credentials.ClientID,
+		ClientSecret: credentials.ClientSecret,
+		Endpoint: oauth2.Endpoint{
+			TokenURL: "https://www.reddit.com/api/v1/access_token",
+			AuthURL:  "https://www.reddit.com/api/v1/authorize",
+		},
+	}
+	
+	// Create an OAuth2 token for password credentials
+	token, err := oauth2Config.PasswordCredentialsToken(ctx, credentials.Username, credentials.Password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OAuth token: %v", err)
+	}
+	
+	// Create HTTP client with OAuth2
+	httpClient := oauth2Config.Client(ctx, token)
+	httpClient.Timeout = time.Second * 30
+	
+	// Create Reddit client with user agent
+	userAgent := fmt.Sprintf("script:reddit2dynalist:v1.0 (by /u/%s)", credentials.Username)
+	
+	return &RedditClient{
+		Credentials: credentials,
+		HTTPClient:  httpClient,
+		UserAgent:   userAgent,
+	}, nil
+}
+
+// GetSavedPosts retrieves saved posts from Reddit
+func (r *RedditClient) GetSavedPosts(ctx context.Context, limit int) ([]RedditPost, error) {
+	url := fmt.Sprintf("https://oauth.reddit.com/user/%s/saved?limit=%d&sort=new", 
+		r.Credentials.Username, limit)
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("User-Agent", r.UserAgent)
+	
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Reddit API error: %s, Body: %s", resp.Status, string(body))
+	}
+	
+	var redditResp RedditResponse
+	if err := json.NewDecoder(resp.Body).Decode(&redditResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	var posts []RedditPost
+	for _, child := range redditResp.Data.Children {
+		post := child.Data
+		post.FullID = child.Kind + "_" + post.ID
+		post.IsComment = (child.Kind == "t1")
+		posts = append(posts, post)
+	}
+	
+	return posts, nil
+}
+
+// VerifyAuthentication verifies that the client can authenticate with Reddit
+func (r *RedditClient) VerifyAuthentication(ctx context.Context) error {
+	url := fmt.Sprintf("https://oauth.reddit.com/api/v1/me")
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("User-Agent", r.UserAgent)
+	
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Reddit API error: %s, Body: %s", resp.Status, string(body))
+	}
+	
+	var user struct {
+		Name string `json:"name"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	if user.Name != r.Credentials.Username {
+		return fmt.Errorf("authenticated as %s instead of %s", user.Name, r.Credentials.Username)
+	}
+	
+	return nil
+}
+
 // NewDynalistClient creates a new Dynalist client
 func NewDynalistClient(apiKey string) *DynalistClient {
 	return &DynalistClient{
@@ -92,9 +241,6 @@ func NewDynalistClient(apiKey string) *DynalistClient {
 
 // CreateItem creates a new item in a Dynalist document
 func (d *DynalistClient) CreateItem(documentID string, content string) error {
-	// Using the correct Dynalist API endpoint for adding items
-	// https://dynalist.io/developer/api#doc-edit
-	
 	// Create a change object to add a new item at the root level
 	change := DynalistChange{
 		Action:   "insert",
@@ -103,7 +249,7 @@ func (d *DynalistClient) CreateItem(documentID string, content string) error {
 		Index:    0,      // Add at the beginning
 	}
 	
-	req := DynalistCreateItemRequest{
+	req := DynalistEditRequest{
 		Token:   d.APIKey,
 		FileID:  documentID,
 		Changes: []DynalistChange{change},
@@ -114,7 +260,6 @@ func (d *DynalistClient) CreateItem(documentID string, content string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Using the correct endpoint from Dynalist docs
 	url := fmt.Sprintf("%s/doc/edit", d.BaseURL)
 	httpReq, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
@@ -210,65 +355,35 @@ func main() {
 	
 	log.Printf("Loaded cache with %d previously processed posts", len(cache.Posts))
 
-	// Load Reddit credentials from environment variables
-	credentials := reddit.Credentials{
-		ID:       os.Getenv("REDDIT_CLIENT_ID"),
-		Secret:   os.Getenv("REDDIT_CLIENT_SECRET"),
-		Username: os.Getenv("REDDIT_USERNAME"),
-		Password: os.Getenv("REDDIT_PASSWORD"),
+	// Load credentials from environment variables
+	credentials := RedditCredentials{
+		ClientID:     os.Getenv("REDDIT_CLIENT_ID"),
+		ClientSecret: os.Getenv("REDDIT_CLIENT_SECRET"),
+		Username:     os.Getenv("REDDIT_USERNAME"),
+		Password:     os.Getenv("REDDIT_PASSWORD"),
 	}
 
 	// Validate all required environment variables
-	if credentials.ID == "" || credentials.Secret == "" || 
+	if credentials.ClientID == "" || credentials.ClientSecret == "" || 
 	   credentials.Username == "" || credentials.Password == "" ||
 	   os.Getenv("DYNALIST_API_KEY") == "" {
 		log.Fatal("Missing required environment variables. Please set REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD, and DYNALIST_API_KEY")
 	}
 
-	// Create Reddit client with appropriate user agent
-	// The Reddit API requires a user agent in specific format
-	userAgent := fmt.Sprintf("script:reddit2dynalist:v1.0 (by /u/%s)", credentials.Username)
-	
-	// Set up OAuth2 configuration for Reddit
-	ctx := context.Background()
-	oauth2Config := &oauth2.Config{
-		ClientID:     credentials.ID,
-		ClientSecret: credentials.Secret,
-		Endpoint: oauth2.Endpoint{
-			TokenURL: "https://www.reddit.com/api/v1/access_token",
-			AuthURL:  "https://www.reddit.com/api/v1/authorize",
-		},
-	}
-	
-	// Create an OAuth2 token for password credentials
-	token, err := oauth2Config.PasswordCredentialsToken(ctx, credentials.Username, credentials.Password)
-	if err != nil {
-		log.Fatalf("Failed to get OAuth token: %v", err)
-	}
-	
-	// Create HTTP client with OAuth2
-	httpClient := oauth2Config.Client(ctx, token)
-	httpClient.Timeout = time.Second * 30
-	
-	// Create Reddit client with OAuth HTTP client
-	client, err := reddit.NewClient(credentials,
-		reddit.WithUserAgent(userAgent),
-		reddit.WithHTTPClient(httpClient),
-	)
-	
+	// Create Reddit client
+	redditClient, err := NewRedditClient(credentials)
 	if err != nil {
 		log.Fatal("Failed to create Reddit client:", err)
 	}
 
 	// Verify Reddit authentication
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	
-	me, _, err := client.User.Get(ctx, credentials.Username)
-	if err != nil {
-		log.Fatalf("Failed to authenticate with Reddit: %v (Check your credentials and ensure your app is set up as a 'script' type)", err)
+	if err := redditClient.VerifyAuthentication(ctx); err != nil {
+		cancel()
+		log.Fatalf("Failed to authenticate with Reddit: %v", err)
 	}
-	log.Printf("Successfully authenticated as: %s", me.Name)
+	cancel()
+	log.Printf("Successfully authenticated as: %s", credentials.Username)
 
 	// Create Dynalist client
 	dynalist := NewDynalistClient(os.Getenv("DYNALIST_API_KEY"))
@@ -289,32 +404,26 @@ func main() {
 	log.Printf("Starting to check for new saved posts every 5 minutes...")
 
 	// Process saved posts immediately on startup
-	processNewPosts(client, dynalist, documentID, cache, cacheFile)
+	processNewPosts(redditClient, dynalist, documentID, cache, cacheFile)
 
 	// Then process on each tick
 	for range ticker.C {
-		processNewPosts(client, dynalist, documentID, cache, cacheFile)
+		processNewPosts(redditClient, dynalist, documentID, cache, cacheFile)
 	}
 }
 
 func processNewPosts(
-	redditClient *reddit.Client,
+	redditClient *RedditClient,
 	dynalistClient *DynalistClient,
 	documentID string,
 	cache *Cache,
 	cacheFile string,
 ) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	
-	// Get saved posts sorted by new
-	saved, _, _, err := redditClient.User.Saved(ctx, &reddit.ListUserOverviewOptions{
-		ListOptions: reddit.ListOptions{
-			Limit: 25,
-		},
-		Sort: "new",
-		Time: "all", // Get all saved posts, we'll filter with our cache
-	})
-	
+	// Get saved posts
+	posts, err := redditClient.GetSavedPosts(ctx, 25)
 	if err != nil {
 		log.Printf("Error fetching saved posts: %v", err)
 		return
@@ -324,7 +433,7 @@ func processNewPosts(
 	newPosts := 0
 
 	// Process each post
-	for _, post := range saved {
+	for _, post := range posts {
 		// Skip if we've already processed this post
 		if _, exists := cache.Posts[post.FullID]; exists {
 			continue
@@ -335,11 +444,12 @@ func processNewPosts(
 		
 		// Create content for Dynalist
 		var content string
-		if post.Title != "" {
-			content = post.Title + " - https://reddit.com" + post.Permalink
+		if post.IsComment {
+			content = fmt.Sprintf("Comment by %s - https://reddit.com%s", post.Author, post.Permalink)
+		} else if post.Title != "" {
+			content = fmt.Sprintf("%s - https://reddit.com%s", post.Title, post.Permalink)
 		} else {
-			// Handle comments which may not have a title
-			content = "Comment by " + post.Author + " - https://reddit.com" + post.Permalink
+			content = fmt.Sprintf("Post by %s - https://reddit.com%s", post.Author, post.Permalink)
 		}
 
 		log.Printf("Adding new saved post to Dynalist: %s", content)
